@@ -36,8 +36,6 @@ ThrustStream<T>::ThrustStream(const intptr_t array_size, int device)
   std::cout << "Thrust backend: TBB" << std::endl;
 #elif THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_CPP
   std::cout << "Thrust backend: CPP" << std::endl;
-#elif THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_TBB
-  std::cout << "Thrust backend: TBB" << std::endl;
 #else
 
 #if defined(THRUST_DEVICE_SYSTEM_HIP) && THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_HIP
