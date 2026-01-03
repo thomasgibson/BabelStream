@@ -16,7 +16,7 @@
 
 #define IMPLEMENTATION_STRING "HIP"
 
-#define TBSIZE 1024
+#define TBSIZE 256
 
 
 template <class T>
