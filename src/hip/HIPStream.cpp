@@ -6,87 +6,75 @@
 
 
 #include "HIPStream.h"
-#include "hip/hip_runtime.h"
 
-#define TBSIZE 1024
-
-
-void check_error(void)
-{
-  hipError_t err = hipGetLastError();
-  if (err != hipSuccess)
-  {
-    std::cerr << "Error: " << hipGetErrorString(err) << std::endl;
-    exit(err);
-  }
+[[noreturn]] inline void error(char const* file, int line, char const* expr, hipError_t e) {
+  std::fprintf(stderr, "Error at %s:%d: %s (%d)\n  %s\n", file, line, hipGetErrorString(e), e, expr);
+  exit(e);
 }
+
+// The do while is there to make sure you remember to put a semi-colon after calling HIP_CHECK
+#define HIP_CHECK(EXPR) do { auto __e = (EXPR); if (__e != hipSuccess) error(__FILE__, __LINE__, #EXPR, __e); } while(false)
 
 // It is best practice to include __device__ and constexpr even though in BabelStream it only needs to be __host__ const
 __host__ __device__ constexpr size_t ceil_div(size_t a, size_t b) { return (a + b - 1)/b; }
 
+hipStream_t stream;
+
 template <class T>
-HIPStream<T>::HIPStream(const intptr_t ARRAY_SIZE, const int device_index)
+HIPStream<T>::HIPStream(const intptr_t array_size, const int device_index)
+  : array_size(array_size)
 {
   // Set device
   int count;
-  hipGetDeviceCount(&count);
-  check_error();
+  HIP_CHECK(hipGetDeviceCount(&count));
   if (device_index >= count)
     throw std::runtime_error("Invalid device index");
-  hipSetDevice(device_index);
-  check_error();
+  HIP_CHECK(hipSetDevice(device_index));
+
+  HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
   // Print out device information
   std::cout << "Using HIP device " << getDeviceName(device_index) << std::endl;
   std::cout << "Driver: " << getDeviceDriver(device_index) << std::endl;
 #if defined(MANAGED)
-    std::cout << "Memory: MANAGED" << std::endl;
+  std::cout << "Memory: MANAGED" << std::endl;
 #elif defined(PAGEFAULT)
-    std::cout << "Memory: PAGEFAULT" << std::endl;
+  std::cout << "Memory: PAGEFAULT" << std::endl;
 #else
-    std::cout << "Memory: DEFAULT" << std::endl;
+  std::cout << "Memory: DEFAULT" << std::endl;
 #endif
 
-  array_size = ARRAY_SIZE;
-  // Round dot_num_blocks up to next multiple of (TBSIZE * dot_elements_per_lane)
-  dot_num_blocks = (array_size + (TBSIZE * dot_elements_per_lane - 1)) / (TBSIZE * dot_elements_per_lane);
+  // Query device for sensible dot kernel block count
+  hipDeviceProp_t props;
+  HIP_CHECK(hipGetDeviceProperties(&props, device_index));
+  dot_num_blocks = props.multiProcessorCount * 4;
 
-  size_t array_bytes = sizeof(T);
-  array_bytes *= ARRAY_SIZE;
-  size_t total_bytes = array_bytes * 3;
-
-  // Allocate the host array for partial sums for dot kernels using hipHostMalloc.
-  // This creates an array on the host which is visible to the device. However, it requires
-  // synchronization (e.g. hipDeviceSynchronize) for the result to be available on the host
-  // after it has been passed through to a kernel.
-  hipHostMalloc(&sums, sizeof(T) * dot_num_blocks, hipHostMallocNonCoherent);
-  check_error();
+  // Size of partial sums for dot kernels
+  size_t sums_bytes = sizeof(T) * dot_num_blocks;
+  size_t array_bytes = sizeof(T) * array_size;
+  size_t total_bytes = array_bytes * size_t(3) + sums_bytes;
+  std::cout << "Reduction kernel config: " << dot_num_blocks << " groups of (fixed) size " << TBSIZE << std::endl;
 
   // Check buffers fit on the device
-  hipDeviceProp_t props;
-  hipGetDeviceProperties(&props, 0);
-  if (props.totalGlobalMem < std::size_t{3}*ARRAY_SIZE*sizeof(T))
+  if (props.totalGlobalMem < total_bytes)
     throw std::runtime_error("Device does not have enough memory for all 3 buffers");
 
   // Create device buffers
 #if defined(MANAGED)
-  hipMallocManaged(&d_a, array_bytes);
-  check_error();
-  hipMallocManaged(&d_b, array_bytes);
-  check_error();
-  hipMallocManaged(&d_c, array_bytes);
-  check_error();
+  HIP_CHECK(hipMallocManaged(&d_a, array_bytes));
+  HIP_CHECK(hipMallocManaged(&d_b, array_bytes));
+  HIP_CHECK(hipMallocManaged(&d_c, array_bytes));
+  HIP_CHECK(hipHostMalloc(&sums, sums_bytes, hipHostMallocDefault));
 #elif defined(PAGEFAULT)
   d_a = (T*)malloc(array_bytes);
   d_b = (T*)malloc(array_bytes);
   d_c = (T*)malloc(array_bytes);
+  sums = (T*)malloc(sums_bytes);
 #else
-  hipMalloc(&d_a, array_bytes);
-  check_error();
-  hipMalloc(&d_b, array_bytes);
-  check_error();
-  hipMalloc(&d_c, array_bytes);
-  check_error();
+  HIP_CHECK(hipMalloc(&d_a, array_bytes));
+  HIP_CHECK(hipMalloc(&d_b, array_bytes));
+  HIP_CHECK(hipMalloc(&d_c, array_bytes));
+  HIP_CHECK(hipHostMalloc(&sums, sums_bytes, hipHostMallocDefault));
 #endif
 }
 
@@ -94,15 +82,19 @@ HIPStream<T>::HIPStream(const intptr_t ARRAY_SIZE, const int device_index)
 template <class T>
 HIPStream<T>::~HIPStream()
 {
-  hipHostFree(sums);
-  check_error();
+  HIP_CHECK(hipStreamDestroy(stream));
 
-  hipFree(d_a);
-  check_error();
-  hipFree(d_b);
-  check_error();
-  hipFree(d_c);
-  check_error();
+#if defined(PAGEFAULT)
+  free(d_a);
+  free(d_b);
+  free(d_c);
+  free(sums);
+#else
+  HIP_CHECK(hipFree(d_a));
+  HIP_CHECK(hipFree(d_b));
+  HIP_CHECK(hipFree(d_c));
+  HIP_CHECK(hipHostFree(sums));
+#endif
 }
 
 
@@ -120,10 +112,9 @@ template <class T>
 void HIPStream<T>::init_arrays(T initA, T initB, T initC)
 {
   size_t blocks = ceil_div(array_size, TBSIZE);
-  init_kernel<T><<<dim3(blocks), dim3(TBSIZE), 0, 0>>>(d_a, d_b, d_c, initA, initB, initC, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  init_kernel<<<blocks, TBSIZE, 0, stream>>>(d_a, d_b, d_c, initA, initB, initC, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 template <class T>
@@ -132,20 +123,17 @@ void HIPStream<T>::read_arrays(std::vector<T>& a, std::vector<T>& b, std::vector
 
   // Copy device memory to host
 #if defined(PAGEFAULT) || defined(MANAGED)
-    hipDeviceSynchronize();
-  for (intptr_t i = 0; i < array_size; i++)
+  HIP_CHECK(hipStreamSynchronize(stream));
+  for (intptr_t i = 0; i < array_size; ++i)
   {
     a[i] = d_a[i];
     b[i] = d_b[i];
     c[i] = d_c[i];
   }
 #else
-  hipMemcpy(a.data(), d_a, a.size()*sizeof(T), hipMemcpyDeviceToHost);
-  check_error();
-  hipMemcpy(b.data(), d_b, b.size()*sizeof(T), hipMemcpyDeviceToHost);
-  check_error();
-  hipMemcpy(c.data(), d_c, c.size()*sizeof(T), hipMemcpyDeviceToHost);
-  check_error();
+  HIP_CHECK(hipMemcpy(a.data(), d_a, a.size()*sizeof(T), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(b.data(), d_b, b.size()*sizeof(T), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(c.data(), d_c, c.size()*sizeof(T), hipMemcpyDeviceToHost));
 #endif
 }
 
@@ -161,10 +149,9 @@ template <class T>
 void HIPStream<T>::copy()
 {
   size_t blocks = ceil_div(array_size, TBSIZE);
-  copy_kernel<T><<<dim3(blocks), dim3(TBSIZE), 0, 0>>>(d_a, d_c, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  copy_kernel<<<blocks, TBSIZE, 0, stream>>>(d_a, d_c, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 template <typename T>
@@ -180,10 +167,9 @@ template <class T>
 void HIPStream<T>::mul()
 {
   size_t blocks = ceil_div(array_size, TBSIZE);
-  mul_kernel<T><<<dim3(blocks), dim3(TBSIZE), 0, 0>>>(d_b, d_c, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  mul_kernel<<<blocks, TBSIZE, 0, stream>>>(d_b, d_c, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 template <typename T>
@@ -198,10 +184,9 @@ template <class T>
 void HIPStream<T>::add()
 {
   size_t blocks = ceil_div(array_size, TBSIZE);
-  add_kernel<T><<<dim3(blocks), dim3(TBSIZE), 0, 0>>>(d_a, d_b, d_c, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  add_kernel<<<blocks, TBSIZE, 0, stream>>>(d_a, d_b, d_c, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 template <typename T>
@@ -217,10 +202,9 @@ template <class T>
 void HIPStream<T>::triad()
 {
   size_t blocks = ceil_div(array_size, TBSIZE);
-  triad_kernel<T><<<dim3(blocks), dim3(TBSIZE), 0, 0>>>(d_a, d_b, d_c, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  triad_kernel<<<blocks, TBSIZE, 0, stream>>>(d_a, d_b, d_c, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 template <typename T>
@@ -236,48 +220,40 @@ template <class T>
 void HIPStream<T>::nstream()
 {
   size_t blocks = ceil_div(array_size, TBSIZE);
-  nstream_kernel<T><<<dim3(blocks), dim3(TBSIZE), 0, 0>>>(d_a, d_b, d_c, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  nstream_kernel<<<blocks, TBSIZE, 0, stream>>>(d_a, d_b, d_c, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
-template <typename T>
-__global__ void dot_kernel(const T * a, const T * b, T * sum, size_t array_size)
+template <class T>
+__global__ void dot_kernel(const T * a, const T * b, T* sums, size_t array_size)
 {
-  __shared__ T tb_sum[TBSIZE];
+  __shared__ T smem[TBSIZE];
+  T tmp = T(0.);
+  const size_t tidx = threadIdx.x;
+  for (size_t i = tidx + (size_t)blockDim.x * blockIdx.x; i < array_size; i += (size_t)gridDim.x * blockDim.x) {
+    tmp += a[i] * b[i];
+  }
+  smem[tidx] = tmp;
 
-  const size_t local_i = threadIdx.x;
-  size_t i = blockDim.x * blockIdx.x + local_i;
-
-  tb_sum[local_i] = {};
-  for (; i < array_size; i += blockDim.x*gridDim.x)
-    tb_sum[local_i] += a[i] * b[i];
-
-  for (size_t offset = blockDim.x / 2; offset > 0; offset /= 2)
-  {
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
     __syncthreads();
-    if (local_i < offset)
-    {
-      tb_sum[local_i] += tb_sum[local_i+offset];
-    }
+    if (tidx < offset) smem[tidx] += smem[tidx+offset];
   }
 
-  if (local_i == 0)
-    sum[blockIdx.x] = tb_sum[local_i];
+  // First thread writes to host memory directly from the device
+  if (tidx == 0) sums[blockIdx.x] = smem[tidx];
 }
 
 template <class T>
 T HIPStream<T>::dot()
 {
-  dot_kernel<T><<<dim3(dot_num_blocks), dim3(TBSIZE), 0, 0>>>(d_a, d_b, sums, array_size);
-  check_error();
-  hipDeviceSynchronize();
-  check_error();
+  dot_kernel<<<dot_num_blocks, TBSIZE, 0, stream>>>(d_a, d_b, sums, array_size);
+  HIP_CHECK(hipPeekAtLastError());
+  HIP_CHECK(hipStreamSynchronize(stream));
 
-  T sum{};
-  for (intptr_t i = 0; i < dot_num_blocks; i++)
-    sum += sums[i];
+  T sum = 0.0;
+  for (intptr_t i = 0; i < dot_num_blocks; ++i) sum += sums[i];
 
   return sum;
 }
@@ -286,8 +262,7 @@ void listDevices(void)
 {
   // Get number of devices
   int count;
-  hipGetDeviceCount(&count);
-  check_error();
+  HIP_CHECK(hipGetDeviceCount(&count));
 
   // Print device names
   if (count == 0)
@@ -310,19 +285,16 @@ void listDevices(void)
 std::string getDeviceName(const int device)
 {
   hipDeviceProp_t props;
-  hipGetDeviceProperties(&props, device);
-  check_error();
+  HIP_CHECK(hipGetDeviceProperties(&props, device));
   return std::string(props.name);
 }
 
 
 std::string getDeviceDriver(const int device)
 {
-  hipSetDevice(device);
-  check_error();
+  HIP_CHECK(hipSetDevice(device));
   int driver;
-  hipDriverGetVersion(&driver);
-  check_error();
+  HIP_CHECK(hipDriverGetVersion(&driver));
   return std::to_string(driver);
 }
 
